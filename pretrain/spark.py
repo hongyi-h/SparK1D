@@ -3,184 +3,224 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+#
+# Adapted for 1D signals (ECG, audio, time series) by HeartAge project.
 
 from pprint import pformat
 from typing import List
-
 import sys
+
 import torch
 import torch.nn as nn
-from timm.models.layers import trunc_normal_
 
-import encoder
-from decoder import LightDecoder
+from . import encoder as encoder_module
+from .decoder import LightDecoder1D
 
 
-class SparK(nn.Module):
+class SparK1D(nn.Module):
+    """Sparse and Hierarchical Masked Modeling for 1D ConvNets.
+
+    Workflow:
+      1. Mask random patches at feature-map resolution
+      2. Encode with sparse convolutions (masked positions zeroed after every layer)
+      3. Densify: fill masked positions with learnable mask tokens
+      4. Decode with hierarchical UNet (multi-scale skip connections)
+      5. Loss: per-patch-normalized MSE on masked patches only
+    """
+
     def __init__(
-            self, sparse_encoder: encoder.SparseEncoder, dense_decoder: LightDecoder,
-            mask_ratio=0.6, densify_norm='bn', sbn=False,
+        self,
+        sparse_encoder: encoder_module.SparseEncoder1D,
+        dense_decoder: LightDecoder1D,
+        mask_ratio=0.6,
+        input_size=4992,
+        densify_norm='bn',
+        sbn=False,
     ):
         super().__init__()
-        input_size, downsample_raito = sparse_encoder.input_size, sparse_encoder.downsample_raito
-        self.downsample_raito = downsample_raito
-        self.fmap_h, self.fmap_w = input_size // downsample_raito, input_size // downsample_raito
+        downsample_ratio = sparse_encoder.downsample_ratio
+        self.downsample_ratio = downsample_ratio
+        self.fmap_len = input_size // downsample_ratio
+        self.input_size = input_size
         self.mask_ratio = mask_ratio
-        self.len_keep = round(self.fmap_h * self.fmap_w * (1 - mask_ratio))
-        
+        self.len_keep = round(self.fmap_len * (1 - mask_ratio))
+
         self.sparse_encoder = sparse_encoder
         self.dense_decoder = dense_decoder
-        
+
         self.sbn = sbn
         self.hierarchy = len(sparse_encoder.enc_feat_map_chs)
         self.densify_norm_str = densify_norm.lower()
         self.densify_norms = nn.ModuleList()
         self.densify_projs = nn.ModuleList()
         self.mask_tokens = nn.ParameterList()
-        
-        # build the `densify` layers
-        e_widths, d_width = self.sparse_encoder.enc_feat_map_chs, self.dense_decoder.width
-        e_widths: List[int]
-        for i in range(self.hierarchy): # from the smallest feat map to the largest; i=0: the last feat map; i=1: the second last feat map ...
+
+        # Build densify layers (from smallest to largest feature map)
+        e_widths = list(sparse_encoder.enc_feat_map_chs)  # copy
+        d_width = self.dense_decoder.width
+        for i in range(self.hierarchy):
             e_width = e_widths.pop()
-            # create mask token
-            p = nn.Parameter(torch.zeros(1, e_width, 1, 1))
-            trunc_normal_(p, mean=0, std=.02, a=-.02, b=.02)
+
+            # Learnable mask token for this scale
+            p = nn.Parameter(torch.zeros(1, e_width, 1))
+            nn.init.trunc_normal_(p, mean=0, std=.02, a=-.02, b=.02)
             self.mask_tokens.append(p)
-            
-            # create densify norm
+
+            # Densify normalization
             if self.densify_norm_str == 'bn':
-                densify_norm = (encoder.SparseSyncBatchNorm2d if self.sbn else encoder.SparseBatchNorm2d)(e_width)
-            elif self.densify_norm_str == 'ln':
-                densify_norm = encoder.SparseConvNeXtLayerNorm(e_width, data_format='channels_first', sparse=True)
+                dnorm = (encoder_module.SparseSyncBatchNorm1d if self.sbn
+                         else encoder_module.SparseBatchNorm1d)(e_width)
             else:
-                densify_norm = nn.Identity()
-            self.densify_norms.append(densify_norm)
-            
-            # create densify proj
+                dnorm = nn.Identity()
+            self.densify_norms.append(dnorm)
+
+            # Densify projection (map encoder channels → decoder channels)
             if i == 0 and e_width == d_width:
-                densify_proj = nn.Identity()    # todo: NOTE THAT CONVNEXT-S WOULD USE THIS, because it has a width of 768 that equals to the decoder's width 768
-                print(f'[SparK.__init__, densify {i+1}/{self.hierarchy}]: use nn.Identity() as densify_proj')
+                densify_proj = nn.Identity()
             else:
-                kernel_size = 1 if i <= 0 else 3
-                densify_proj = nn.Conv2d(e_width, d_width, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, bias=True)
-                print(f'[SparK.__init__, densify {i+1}/{self.hierarchy}]: densify_proj(ksz={kernel_size}, #para={sum(x.numel() for x in densify_proj.parameters()) / 1e6:.2f}M)')
+                ks = 1 if i == 0 else 3
+                densify_proj = nn.Conv1d(
+                    e_width, d_width, kernel_size=ks,
+                    stride=1, padding=ks // 2, bias=True,
+                )
             self.densify_projs.append(densify_proj)
-            
-            # todo: the decoder's width follows a simple halfing rule; you can change it to any other rule
+
             d_width //= 2
-        
-        print(f'[SparK.__init__] dims of mask_tokens={tuple(p.numel() for p in self.mask_tokens)}')
-        
-        # these are deprecated and would never be used; can be removed.
-        self.register_buffer('imn_m', torch.empty(1, 3, 1, 1))
-        self.register_buffer('imn_s', torch.empty(1, 3, 1, 1))
-        self.register_buffer('norm_black', torch.zeros(1, 3, input_size, input_size))
-        self.vis_active = self.vis_active_ex = self.vis_inp = self.vis_inp_mask = ...
-    
+
     def mask(self, B: int, device, generator=None):
-        h, w = self.fmap_h, self.fmap_w
-        idx = torch.rand(B, h * w, generator=generator).argsort(dim=1)
-        idx = idx[:, :self.len_keep].to(device)  # (B, len_keep)
-        return torch.zeros(B, h * w, dtype=torch.bool, device=device).scatter_(dim=1, index=idx, value=True).view(B, 1, h, w)
-    
-    def forward(self, inp_bchw: torch.Tensor, active_b1ff=None, vis=False):
-        # step1. Mask
-        if active_b1ff is None:     # rand mask
-            active_b1ff: torch.BoolTensor = self.mask(inp_bchw.shape[0], inp_bchw.device)  # (B, 1, f, f)
-        encoder._cur_active = active_b1ff    # (B, 1, f, f)
-        active_b1hw = active_b1ff.repeat_interleave(self.downsample_raito, 2).repeat_interleave(self.downsample_raito, 3)  # (B, 1, H, W)
-        masked_bchw = inp_bchw * active_b1hw
-        
-        # step2. Encode: get hierarchical encoded sparse features (a list containing 4 feature maps at 4 scales)
-        fea_bcffs: List[torch.Tensor] = self.sparse_encoder(masked_bchw)
-        fea_bcffs.reverse()  # after reversion: from the smallest feature map to the largest
-        
-        # step3. Densify: get hierarchical dense features for decoding
-        cur_active = active_b1ff     # (B, 1, f, f)
+        """Generate random patch-level mask. Returns (B, 1, fmap_len) bool tensor."""
+        f = self.fmap_len
+        idx = torch.rand(B, f, generator=generator).argsort(dim=1)
+        idx = idx[:, :self.len_keep].to(device)
+        return torch.zeros(B, f, dtype=torch.bool, device=device).scatter_(
+            dim=1, index=idx, value=True,
+        ).view(B, 1, f)
+
+    def forward(self, inp_bcl: torch.Tensor, active_b1f=None):
+        """
+        Args:
+            inp_bcl: (B, C, L) input signal (e.g. 12-lead ECG)
+            active_b1f: optional pre-computed mask (B, 1, fmap_len), True=keep
+
+        Returns:
+            recon_loss: scalar, per-patch-normalized MSE on masked positions
+        """
+        # Step 1: Mask
+        if active_b1f is None:
+            active_b1f = self.mask(inp_bcl.shape[0], inp_bcl.device)
+        encoder_module._cur_active = active_b1f  # (B, 1, f)
+        # Expand mask to input resolution
+        active_b1l = active_b1f.repeat_interleave(
+            self.downsample_ratio, dim=2,
+        )  # (B, 1, L)
+        masked_bcl = inp_bcl * active_b1l
+
+        # Step 2: Sparse encode → hierarchical features
+        fea_list: List[torch.Tensor] = self.sparse_encoder(masked_bcl)
+        fea_list.reverse()  # now: smallest → largest feature map
+
+        # Step 3: Densify — fill masked positions with mask tokens
+        cur_active = active_b1f  # (B, 1, f)
         to_dec = []
-        for i, bcff in enumerate(fea_bcffs):  # from the smallest feature map to the largest
-            if bcff is not None:
-                bcff = self.densify_norms[i](bcff)
-                mask_tokens = self.mask_tokens[i].expand_as(bcff)
-                bcff = torch.where(cur_active.expand_as(bcff), bcff, mask_tokens)   # fill in empty (non-active) positions with [mask] tokens
-                bcff: torch.Tensor = self.densify_projs[i](bcff)
-            to_dec.append(bcff)
-            cur_active = cur_active.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)  # dilate the mask map, from (B, 1, f, f) to (B, 1, H, W)
-        
-        # step4. Decode and reconstruct
-        rec_bchw = self.dense_decoder(to_dec)
-        inp, rec = self.patchify(inp_bchw), self.patchify(rec_bchw)   # inp and rec: (B, L = f*f, N = C*downsample_raito**2)
+        for i, bcf in enumerate(fea_list):
+            if bcf is not None:
+                bcf = self.densify_norms[i](bcf)
+                mask_tokens = self.mask_tokens[i].expand_as(bcf)
+                bcf = torch.where(
+                    cur_active.expand_as(bcf), bcf, mask_tokens,
+                )
+                bcf = self.densify_projs[i](bcf)
+            to_dec.append(bcf)
+            cur_active = cur_active.repeat_interleave(2, dim=2)
+
+        # Step 4: Decode
+        rec_bcl = self.dense_decoder(to_dec)
+
+        # Step 5: Per-patch-normalized MSE loss on masked positions
+        inp = self._patchify(inp_bcl)  # (B, n_patches, C * patch_size)
+        rec = self._patchify(rec_bcl)
+
+        # Compute loss in FP32 for numerical stability
+        inp = inp.float()
+        rec = rec.float()
         mean = inp.mean(dim=-1, keepdim=True)
         var = (inp.var(dim=-1, keepdim=True) + 1e-6) ** .5
         inp = (inp - mean) / var
-        l2_loss = ((rec - inp) ** 2).mean(dim=2, keepdim=False)    # (B, L, C) ==mean==> (B, L)
-        
-        non_active = active_b1ff.logical_not().int().view(active_b1ff.shape[0], -1)  # (B, 1, f, f) => (B, L)
-        recon_loss = l2_loss.mul_(non_active).sum() / (non_active.sum() + 1e-8)  # loss only on masked (non-active) patches
-        
-        if vis:
-            masked_bchw = inp_bchw * active_b1hw
-            rec_bchw = self.unpatchify(rec * var + mean)
-            rec_or_inp = torch.where(active_b1hw, inp_bchw, rec_bchw)
-            return inp_bchw, masked_bchw, rec_or_inp
-        else:
-            return recon_loss
-    
-    def patchify(self, bchw):
-        p = self.downsample_raito
-        h, w = self.fmap_h, self.fmap_w
-        B, C = bchw.shape[:2]
-        bchw = bchw.reshape(shape=(B, C, h, p, w, p))
-        bchw = torch.einsum('bchpwq->bhwpqc', bchw)
-        bln = bchw.reshape(shape=(B, h * w, C * p ** 2))  # (B, f*f, 3*downsample_raito**2)
-        return bln
-    
-    def unpatchify(self, bln):
-        p = self.downsample_raito
-        h, w = self.fmap_h, self.fmap_w
-        B, C = bln.shape[0], bln.shape[-1] // p ** 2
-        bln = bln.reshape(shape=(B, h, w, p, p, C))
-        bln = torch.einsum('bhwpqc->bchpwq', bln)
-        bchw = bln.reshape(shape=(B, C, h * p, w * p))
-        return bchw
-    
+
+        l2_loss = ((rec - inp) ** 2).mean(dim=2)  # (B, n_patches)
+        non_active = active_b1f.logical_not().int().view(
+            active_b1f.shape[0], -1,
+        )  # (B, n_patches)
+        recon_loss = l2_loss.mul_(non_active).sum() / (non_active.sum() + 1e-8)
+
+        return recon_loss
+
+    def _patchify(self, bcl):
+        """(B, C, L) → (B, n_patches, C * patch_size)"""
+        p = self.downsample_ratio
+        f = self.fmap_len
+        B, C = bcl.shape[:2]
+        bcl = bcl.reshape(B, C, f, p)           # (B, C, f, p)
+        bcl = bcl.permute(0, 2, 3, 1)           # (B, f, p, C)
+        return bcl.reshape(B, f, C * p)          # (B, f, C*p)
+
+    def _unpatchify(self, bfn):
+        """(B, n_patches, C * patch_size) → (B, C, L)"""
+        p = self.downsample_ratio
+        f = self.fmap_len
+        B = bfn.shape[0]
+        C = bfn.shape[-1] // p
+        bfn = bfn.reshape(B, f, p, C)           # (B, f, p, C)
+        bfn = bfn.permute(0, 3, 1, 2)           # (B, C, f, p)
+        return bfn.reshape(B, C, f * p)          # (B, C, L)
+
+    def get_encoder_state_dict(self):
+        """Extract encoder weights for downstream fine-tuning.
+
+        Returns state_dict with same keys as the original (dense) CNN.
+        """
+        return self.sparse_encoder.sp_cnn.state_dict()
+
     def __repr__(self):
         return (
-            f'\n'
-            f'[SparK.config]: {pformat(self.get_config(), indent=2, width=250)}\n'
-            f'[SparK.structure]: {super(SparK, self).__repr__().replace(SparK.__name__, "")}'
+            f'\n[SparK1D.config]: {pformat(self.get_config(), indent=2, width=250)}\n'
+            f'[SparK1D.structure]: '
+            f'{super(SparK1D, self).__repr__().replace(SparK1D.__name__, "")}'
         )
-    
+
     def get_config(self):
         return {
-            # self
+            'input_size': self.input_size,
             'mask_ratio': self.mask_ratio,
+            'fmap_len': self.fmap_len,
             'densify_norm_str': self.densify_norm_str,
-            'sbn': self.sbn, 'hierarchy': self.hierarchy,
-            
-            # enc
+            'sbn': self.sbn,
+            'hierarchy': self.hierarchy,
+            'downsample_ratio': self.downsample_ratio,
             'sparse_encoder.input_size': self.sparse_encoder.input_size,
-            # dec
             'dense_decoder.width': self.dense_decoder.width,
         }
-    
-    def state_dict(self, destination=None, prefix='', keep_vars=False, with_config=False):
-        state = super(SparK, self).state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False,
+                   with_config=False):
+        state = super().state_dict(
+            destination=destination, prefix=prefix, keep_vars=keep_vars,
+        )
         if with_config:
             state['config'] = self.get_config()
         return state
-    
+
     def load_state_dict(self, state_dict, strict=True):
-        config: dict = state_dict.pop('config', None)
-        incompatible_keys = super(SparK, self).load_state_dict(state_dict, strict=strict)
+        config = state_dict.pop('config', None)
+        incompatible = super().load_state_dict(state_dict, strict=strict)
         if config is not None:
             for k, v in self.get_config().items():
                 ckpt_v = config.get(k, None)
                 if ckpt_v != v:
-                    err = f'[SparseMIM.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={ckpt_v})'
+                    err = (f'[SparK1D.load_state_dict] config mismatch: '
+                           f'this.{k}={v} (ckpt.{k}={ckpt_v})')
                     if strict:
                         raise AttributeError(err)
                     else:
                         print(err, file=sys.stderr)
-        return incompatible_keys
+        return incompatible
